@@ -1,0 +1,10 @@
+hackathons
+exams
+hostel_notices
+seminars
+sports
+scholarships
+assignments
+events
+general_announcements
+placements

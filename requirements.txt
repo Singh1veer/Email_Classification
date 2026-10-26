@@ -1,0 +1,10 @@
+
+pandas
+scikit-learn
+joblib
+streamlit
+python-dateutil
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+beautifulsoup4
