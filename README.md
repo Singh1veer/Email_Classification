@@ -124,14 +124,20 @@ Email_Classification/
 │   └── best_model_cv_predictions.csv
 │
 ├── src/
+│   ├── auto_categorize.py
+│   ├── check_body_integrity.py
+│   ├── create_labeling_queue.py
+│   ├── create_validation_sample.py
+│   ├── inspect_data.py
+│   ├── prepare_data.py
+│   └── sample_emails.py
 │
 ├── app.py
 ├── demo.py
 ├── check_accuracy.py
-├── create_labeling_queue.py
+├── replace_labeling_queue_with_real_emails.py
 ├── train_campusmail_models.py
 ├── unimail_streamlit_app.py
-├── update_verified_labels.py
 │
 ├── test_gmail_connection.py
 ├── test_gmail_classification.py
