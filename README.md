@@ -174,23 +174,6 @@ source .venv/Scripts/activate
 ```bash
 pip install -r requirements.txt
 ```
-
-## 📩 Gmail API Configuration
-
-To connect Gmail:
-
-1. Open the Google Cloud Console.
-2. Create or select a Google Cloud project.
-3. Enable the Gmail API.
-4. Configure the OAuth consent screen.
-5. Create OAuth 2.0 credentials for a Desktop application.
-6. Download the OAuth credentials JSON file.
-7. Rename it to `credentials.json`.
-8. Place it in the project root directory.
-9. Add your Google account as a test user if the OAuth application is in testing mode.
-
-The application uses the following read-only permission:
-
 ```python
 https://www.googleapis.com/auth/gmail.readonly
 ```
