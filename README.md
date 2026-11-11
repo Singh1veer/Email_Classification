@@ -247,9 +247,6 @@ The training pipeline generates:
 - Fraudulent placement and internship email detection.
 - Scholarship announcement fraud detection.
 - Phishing and suspicious email identification.
-- Improved classification through larger verified datasets.
-- Enhanced email analytics and filtering.
-- Further experimentation with advanced NLP and machine learning models.
 
 ## 👨‍💻 Author
 
