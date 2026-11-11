@@ -1,6 +1,6 @@
-
 from pathlib import Path
 import sys
+import re
 
 import joblib
 import pandas as pd
@@ -11,6 +11,9 @@ from sklearn.pipeline import Pipeline
 from sklearn.naive_bayes import MultinomialNB
 from sklearn.linear_model import LogisticRegression
 from sklearn.svm import LinearSVC
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.multiclass import OneVsRestClassifier
+
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
@@ -20,9 +23,8 @@ from sklearn.metrics import (
     confusion_matrix,
 )
 
-# --------------------------------------------------
-# PATHS AND CONFIGURATION
-# --------------------------------------------------
+from xgboost import XGBClassifier
+
 
 ROOT = Path(__file__).resolve().parent
 INPUT_FILE = ROOT / "outputs" / "ml_labeling_queue.xlsx"
@@ -44,7 +46,6 @@ CATEGORIES = [
 
 
 def make_pipeline(classifier):
-    """Create a TF-IDF text classification pipeline."""
     return Pipeline([
         (
             "tfidf",
@@ -62,47 +63,28 @@ def make_pipeline(classifier):
 
 
 def main():
-    # --------------------------------------------------
-    # 1. CHECK INPUT FILE
-    # --------------------------------------------------
 
     if not INPUT_FILE.exists():
-        print(f"ERROR: File not found:\n{INPUT_FILE}")
-        print("Make sure the Excel file is inside the outputs folder.")
+        print("ERROR: Training Excel file not found:", INPUT_FILE)
         sys.exit(1)
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    MODEL_DIR.mkdir(exist_ok=True)
 
-    print("Loading manually verified email labels...")
+    print("Loading the 550-email workbook...")
 
-    try:
-        df = pd.read_excel(INPUT_FILE, sheet_name=0)
-    except PermissionError:
-        print("ERROR: Close the Excel workbook and run this script again.")
-        sys.exit(1)
-    except Exception as error:
-        print(f"ERROR reading Excel: {error}")
-        sys.exit(1)
+    df = pd.read_excel(INPUT_FILE, sheet_name=0)
+    df.columns = [str(c).strip().lower() for c in df.columns]
 
-    df.columns = [str(column).strip().lower() for column in df.columns]
+    required = ["subject", "body", "verified_category"]
 
-    required_columns = ["subject", "body", "verified_category"]
-    missing_columns = [
-        column for column in required_columns
-        if column not in df.columns
-    ]
+    for column in required:
+        if column not in df.columns:
+            raise ValueError(f"Missing required column: {column}")
 
-    if missing_columns:
-        print("ERROR: Required columns are missing:")
-        print(", ".join(missing_columns))
-        print("Columns found:", ", ".join(df.columns))
-        sys.exit(1)
+    print("Total rows in Excel:", len(df))
 
-    # --------------------------------------------------
-    # 2. CLEAN AND VALIDATE LABELS
-    # --------------------------------------------------
-
+    # Keep only manually verified labels.
     df["verified_category"] = (
         df["verified_category"]
         .astype("string")
@@ -110,52 +92,25 @@ def main():
         .str.lower()
     )
 
-    # Ignore rows without a verified label.
     df = df[
         df["verified_category"].notna()
         & (df["verified_category"] != "")
+        & df["verified_category"].isin(CATEGORIES)
     ].copy()
-
-    # Keep only the project's ten valid categories.
-    invalid_mask = ~df["verified_category"].isin(CATEGORIES)
-
-    if invalid_mask.any():
-        invalid_values = sorted(
-            df.loc[invalid_mask, "verified_category"]
-            .dropna()
-            .unique()
-            .tolist()
-        )
-        print("WARNING: Ignoring rows with unexpected labels:")
-        print(invalid_values)
-
-    df = df[df["verified_category"].isin(CATEGORIES)].copy()
-
-    if df.empty:
-        print("ERROR: No valid verified labels were found.")
-        print("Fill in the verified_category column and save the workbook.")
-        sys.exit(1)
 
     df["subject"] = df["subject"].fillna("").astype(str)
     df["body"] = df["body"].fillna("").astype(str)
 
-    # Combine subject and body into one text field.
     df["text"] = (
         df["subject"].str.strip()
         + " "
         + df["body"].str.strip()
     ).str.strip()
 
-    # Remove rows that contain no email text.
     df = df[df["text"].str.len() > 0].copy()
 
     if df.empty:
-        print("ERROR: No non-empty email subjects or bodies were found.")
-        sys.exit(1)
-
-    # --------------------------------------------------
-    # 3. SHOW CATEGORY COUNTS
-    # --------------------------------------------------
+        raise ValueError("No manually verified emails found.")
 
     counts = (
         df["verified_category"]
@@ -163,38 +118,24 @@ def main():
         .reindex(CATEGORIES, fill_value=0)
     )
 
-    print("\nVerified label counts:")
+    print("\nVerified category counts:")
     print(counts.to_string())
-    print(f"\nTotal usable labeled emails: {len(df)}")
+
+    print("\nTotal usable verified emails:", len(df))
 
     if (counts == 0).any():
-        missing = counts[counts == 0].index.tolist()
-        print("\nERROR: These categories have no labeled emails:")
-        print(", ".join(missing))
-        print("Add verified examples before training.")
-        sys.exit(1)
+        raise ValueError(
+            "At least one category has no verified examples."
+        )
 
-    # Choose a fold count that works for the smallest category.
-    min_category_count = int(counts.min())
-    n_splits = min(5, min_category_count)
+    n_splits = min(5, int(counts.min()))
 
     if n_splits < 2:
-        print("ERROR: Every category needs at least 2 labeled emails.")
-        sys.exit(1)
-
-    if (counts != 10).any():
-        print(
-            "\nWARNING: Some categories do not contain exactly "
-            "10 labeled emails."
-        )
-        print(
-            "Check your verified labels to ensure they match the "
-            "email content. Training will use the labels as entered."
+        raise ValueError(
+            "Every category needs at least two verified emails."
         )
 
-    print(
-        f"\nUsing stratified {n_splits}-fold cross-validation."
-    )
+    print(f"\nUsing {n_splits}-fold stratified cross-validation.")
 
     X = df["text"].tolist()
     y = df["verified_category"].tolist()
@@ -205,213 +146,210 @@ def main():
         random_state=42,
     )
 
-    # --------------------------------------------------
-    # 4. DEFINE MODELS
-    # --------------------------------------------------
-
+    # Keep the existing models and add two new models.
     models = {
         "Multinomial Naive Bayes": MultinomialNB(alpha=0.5),
+
         "Logistic Regression": LogisticRegression(
             max_iter=3000,
             random_state=42,
         ),
-        "Linear SVM": LinearSVC(random_state=42),
+
+        "Linear SVM": LinearSVC(
+            random_state=42,
+        ),
+
+        "Random Forest": RandomForestClassifier(
+            n_estimators=300,
+            class_weight="balanced_subsample",
+            random_state=42,
+            n_jobs=-1,
+        ),
+
+        "XGBoost": OneVsRestClassifier(
+            XGBClassifier(
+                objective="binary:logistic",
+                eval_metric="logloss",
+                n_estimators=150,
+                max_depth=4,
+                learning_rate=0.08,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                reg_lambda=1,
+                random_state=42,
+                n_jobs=1,
+                verbosity=0,
+            ),
+            n_jobs=-1,
+        ),
     }
 
     results = []
-    predictions_by_model = {}
+    all_reports = []
+    all_predictions = {}
 
-    # --------------------------------------------------
-    # 5. CROSS-VALIDATED MODEL EVALUATION
-    # --------------------------------------------------
-
-    print("\nTraining and evaluating models...\n")
+    print("\nTraining and evaluating all five models...\n")
 
     for model_name, classifier in models.items():
+
+        print("Evaluating:", model_name)
+
         pipeline = make_pipeline(classifier)
 
-        # Every email is predicted by a model that did not train on it.
         predictions = cross_val_predict(
             pipeline,
             X,
             y,
             cv=cv,
             method="predict",
+            n_jobs=1,
         )
 
-        predictions_by_model[model_name] = predictions
+        all_predictions[model_name] = predictions
 
-        metrics = {
-            "model": model_name,
-            "accuracy": accuracy_score(y, predictions),
-            "macro_precision": precision_score(
-                y,
-                predictions,
-                labels=CATEGORIES,
-                average="macro",
-                zero_division=0,
-            ),
-            "macro_recall": recall_score(
-                y,
-                predictions,
-                labels=CATEGORIES,
-                average="macro",
-                zero_division=0,
-            ),
-            "macro_f1": f1_score(
-                y,
-                predictions,
-                labels=CATEGORIES,
-                average="macro",
-                zero_division=0,
-            ),
-        }
-
-        results.append(metrics)
-
-        print(f"Model: {model_name}")
-        print(f"  Accuracy:        {metrics['accuracy']:.3f}")
-        print(f"  Macro precision: {metrics['macro_precision']:.3f}")
-        print(f"  Macro recall:    {metrics['macro_recall']:.3f}")
-        print(f"  Macro F1:        {metrics['macro_f1']:.3f}")
-        print()
-
-    # --------------------------------------------------
-    # 6. SAVE MODEL COMPARISON
-    # --------------------------------------------------
-
-    results_df = pd.DataFrame(results)
-
-    results_df = results_df.sort_values(
-        by=["macro_f1", "accuracy"],
-        ascending=False,
-    ).reset_index(drop=True)
-
-    comparison_path = OUTPUT_DIR / "model_comparison.csv"
-    results_df.to_csv(comparison_path, index=False)
-
-    print("=" * 65)
-    print("MODEL COMPARISON")
-    print("=" * 65)
-    print(
-        results_df.to_string(
-            index=False,
-            float_format=lambda value: f"{value:.3f}",
+        accuracy = accuracy_score(y, predictions)
+        precision = precision_score(
+            y, predictions, average="macro", zero_division=0
         )
-    )
+        recall = recall_score(
+            y, predictions, average="macro", zero_division=0
+        )
+        f1 = f1_score(
+            y, predictions, average="macro", zero_division=0
+        )
 
-    # Select by macro F1, using accuracy as the tie-breaker.
-    best_model_name = results_df.iloc[0]["model"]
-    best_predictions = predictions_by_model[best_model_name]
+        weighted_precision = precision_score(
+            y, predictions, average="weighted", zero_division=0
+        )
+        weighted_recall = recall_score(
+            y, predictions, average="weighted", zero_division=0
+        )
+        weighted_f1 = f1_score(
+            y, predictions, average="weighted", zero_division=0
+        )
 
-    print(f"\nBest model by cross-validated macro F1: {best_model_name}")
+        results.append({
+            "Model": model_name,
+            "Accuracy": accuracy,
+            "Macro Precision": precision,
+            "Macro Recall": recall,
+            "Macro F1": f1,
+            "Weighted Precision": weighted_precision,
+            "Weighted Recall": weighted_recall,
+            "Weighted F1": weighted_f1,
+        })
 
-    # --------------------------------------------------
-    # 7. SAVE CLASSIFICATION REPORT
-    # --------------------------------------------------
-
-    report = classification_report(
-        y,
-        best_predictions,
-        labels=CATEGORIES,
-        output_dict=True,
-        zero_division=0,
-    )
-
-    report_df = pd.DataFrame(report).transpose()
-
-    report_path = OUTPUT_DIR / "best_model_classification_report.csv"
-    report_df.to_csv(report_path, index_label="category")
-
-    print("\nBest model classification report:")
-    print(
-        classification_report(
+        report = classification_report(
             y,
-            best_predictions,
+            predictions,
             labels=CATEGORIES,
+            output_dict=True,
             zero_division=0,
         )
+
+        for category, values in report.items():
+            if isinstance(values, dict):
+                all_reports.append({
+                    "Model": model_name,
+                    "Category": category,
+                    **values,
+                })
+
+        matrix = confusion_matrix(
+            y,
+            predictions,
+            labels=CATEGORIES,
+        )
+
+        matrix_df = pd.DataFrame(
+            matrix,
+            index=CATEGORIES,
+            columns=CATEGORIES,
+        )
+
+        safe_name = re.sub(
+            r"[^a-z0-9]+", "_", model_name.lower()
+        ).strip("_")
+
+        matrix_df.to_csv(
+            OUTPUT_DIR / f"confusion_matrix_{safe_name}.csv"
+        )
+
+        prediction_df = pd.DataFrame({
+            "subject": df["subject"].values,
+            "verified_category": y,
+            "cross_validation_prediction": predictions,
+            "correct": [
+                actual == predicted
+                for actual, predicted in zip(y, predictions)
+            ],
+        })
+
+        prediction_df.to_csv(
+            OUTPUT_DIR / f"predictions_{safe_name}.csv",
+            index=False,
+        )
+
+        print(
+            f"Accuracy: {accuracy:.4f} | "
+            f"Macro F1: {f1:.4f}"
+        )
+
+    # Save comparison of all models.
+    comparison = pd.DataFrame(results)
+    comparison = comparison.sort_values(
+        "Macro F1", ascending=False
     )
 
-    # --------------------------------------------------
-    # 8. SAVE CONFUSION MATRIX
-    # --------------------------------------------------
-
-    matrix = confusion_matrix(
-        y,
-        best_predictions,
-        labels=CATEGORIES,
+    comparison.to_csv(
+        OUTPUT_DIR / "model_comparison.csv",
+        index=False,
     )
 
-    matrix_df = pd.DataFrame(
-        matrix,
-        index=CATEGORIES,
-        columns=CATEGORIES,
+    pd.DataFrame(all_reports).to_csv(
+        OUTPUT_DIR / "classification_reports_all_models.csv",
+        index=False,
     )
 
-    matrix_df.index.name = "actual_category"
+    # Choose the model with the highest macro F1.
+    best_name = comparison.iloc[0]["Model"]
+    best_classifier = models[best_name]
 
-    matrix_path = OUTPUT_DIR / "best_model_confusion_matrix.csv"
-    matrix_df.to_csv(matrix_path)
+    print("\nBest model:", best_name)
 
-    # --------------------------------------------------
-    # 9. SAVE CROSS-VALIDATION PREDICTIONS
-    # --------------------------------------------------
+    # Fit the winning model on all verified emails.
+    best_pipeline = make_pipeline(best_classifier)
+    best_pipeline.fit(X, y)
 
-    prediction_df = pd.DataFrame({
-        "subject": df["subject"].tolist(),
-        "verified_category": y,
-        "cross_validation_prediction": best_predictions,
-    })
-
-    prediction_df["correct"] = (
-        prediction_df["verified_category"]
-        == prediction_df["cross_validation_prediction"]
+    joblib.dump(
+        best_pipeline,
+        MODEL_DIR / "best_email_classifier.joblib",
     )
 
-    predictions_path = OUTPUT_DIR / "best_model_cv_predictions.csv"
-    prediction_df.to_csv(predictions_path, index=False)
+    with open(MODEL_DIR / "email_categories.txt", "w") as f:
+        f.write("\n".join(CATEGORIES))
 
-    # --------------------------------------------------
-    # 10. TRAIN WINNING PIPELINE ON ALL VERIFIED EMAILS
-    # --------------------------------------------------
+    # Also save every trained model separately.
+    for model_name, classifier in models.items():
 
-    # This final model is for deployment. Evaluation scores above
-    # come from cross-validation predictions, not these fitted rows.
-    final_pipeline = make_pipeline(models[best_model_name])
-    final_pipeline.fit(X, y)
+        safe_name = re.sub(
+            r"[^a-z0-9]+", "_", model_name.lower()
+        ).strip("_")
 
-    model_path = MODEL_DIR / "best_email_classifier.joblib"
-    joblib.dump(final_pipeline, model_path)
+        pipeline = make_pipeline(classifier)
+        pipeline.fit(X, y)
 
-    # Save the category order for reference.
-    categories_path = MODEL_DIR / "email_categories.txt"
-    categories_path.write_text(
-        "\n".join(CATEGORIES) + "\n",
-        encoding="utf-8",
-    )
+        joblib.dump(
+            pipeline,
+            MODEL_DIR / f"{safe_name}_email_classifier.joblib",
+        )
 
-    # --------------------------------------------------
-    # 11. FINISH
-    # --------------------------------------------------
+    print("\n========== FINAL MODEL COMPARISON ==========")
+    print(comparison.to_string(index=False))
 
-    print("\n" + "=" * 65)
-    print("TRAINING COMPLETE")
-    print("=" * 65)
-
-    print("\nFiles created:")
-    print(f"1. {comparison_path}")
-    print(f"2. {report_path}")
-    print(f"3. {matrix_path}")
-    print(f"4. {predictions_path}")
-    print(f"5. {model_path}")
-    print(f"6. {categories_path}")
-
-    print(
-        "\nNote: The dataset contains only about 100 labeled emails. "
-        "Treat the metrics as preliminary and verify labels before "
-        "making accuracy claims."
-    )
+    print("\nAll evaluation files saved in outputs/")
+    print("All trained models saved in models/")
+    print("Best model saved as best_email_classifier.joblib")
 
 
 if __name__ == "__main__":

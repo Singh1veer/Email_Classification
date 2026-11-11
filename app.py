@@ -1,7 +1,7 @@
 from pathlib import Path
 import base64
 import html
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from email.utils import parsedate_to_datetime, parseaddr
 
 import altair as alt
@@ -88,11 +88,110 @@ def pick(mail_id):
 
 # ───────────────────────────── helpers (backend) ─────────────────────────────
 @st.cache_resource
+def _load_model_cached(model_path, modified_ns):
+    # Including the model file's modification time in the cache key ensures
+    # that a newly trained/replaced model is loaded automatically.
+    return joblib.load(model_path)
+
+
 def load_model():
     if not MODEL_PATH.exists():
         raise FileNotFoundError(f"Model not found: {MODEL_PATH}")
-    return joblib.load(MODEL_PATH)
+    modified_ns = MODEL_PATH.stat().st_mtime_ns
+    return _load_model_cached(str(MODEL_PATH), modified_ns)
 
+
+def gmail_date_query(start_date, end_date):
+    """Gmail before: is exclusive, so add one day to include end_date."""
+    exclusive_end = end_date + timedelta(days=1)
+    return (
+        f"after:{start_date.strftime('%Y/%m/%d')} "
+        f"before:{exclusive_end.strftime('%Y/%m/%d')}"
+    )
+
+
+def email_local_dates(frame):
+    """Return each email's date, preferring Gmail's internal timestamp."""
+    if "received_at" in frame.columns:
+        timestamps = pd.to_datetime(frame["received_at"], errors="coerce", utc=True)
+        return timestamps.dt.tz_convert("Asia/Kolkata").dt.date
+
+    # Older cached sessions may only contain a local display date without
+    # a timezone. Do not shift those naive timestamps across midnight.
+    timestamps = pd.to_datetime(frame["date"], errors="coerce")
+    return timestamps.dt.date
+
+
+def filter_by_dates(frame, start_date, end_date):
+    if frame.empty:
+        return frame.copy()
+    days = email_local_dates(frame)
+    mask = days.notna() & (days >= start_date) & (days <= end_date)
+    return frame.loc[mask].copy()
+
+
+def load_model_metrics():
+    """Load and standardize model_comparison.csv across common column names."""
+    if not METRICS_PATH.exists():
+        return pd.DataFrame()
+    try:
+        frame = pd.read_csv(METRICS_PATH)
+    except Exception as exc:
+        st.warning(f"Could not read model comparison file: {exc}")
+        return pd.DataFrame()
+    if frame.empty:
+        return frame
+
+    # Normalize headings such as "Macro F1 Score", "macro-f1", etc.
+    frame.columns = [str(col).strip().lower().replace("%", "percent") for col in frame.columns]
+    frame.columns = ["_".join(str(col).replace("-", " ").replace("/", " ").split()) for col in frame.columns]
+
+    aliases = {
+        "model": ["model", "algorithm", "classifier", "model_name", "algorithm_name"],
+        "accuracy": ["accuracy", "accuracy_score", "test_accuracy", "cv_accuracy", "mean_accuracy"],
+        "macro_precision": ["macro_precision", "precision_macro", "macro_avg_precision", "precision"],
+        "macro_recall": ["macro_recall", "recall_macro", "macro_avg_recall", "recall"],
+        "macro_f1": ["macro_f1", "macro_f1_score", "f1_macro", "f1_score_macro", "macro_avg_f1", "f1_score", "f1"],
+    }
+    rename = {}
+    for standard, choices in aliases.items():
+        if standard not in frame.columns:
+            for candidate in choices:
+                if candidate in frame.columns:
+                    rename[candidate] = standard
+                    break
+    if rename:
+        frame = frame.rename(columns=rename)
+
+    # Convert score columns even if CSV values were saved as strings or percentages.
+    for col in ["accuracy", "macro_precision", "macro_recall", "macro_f1"]:
+        if col in frame.columns:
+            values = pd.to_numeric(frame[col].astype(str).str.replace("%", "", regex=False), errors="coerce")
+            # Values like 75.2 are percentages; values like 0.752 are proportions.
+            if values.dropna().gt(1).any():
+                values = values / 100.0
+            frame[col] = values
+
+    if "model" not in frame.columns:
+        frame["model"] = [f"Model {i + 1}" for i in range(len(frame))]
+
+    # If macro F1 was not saved but macro precision and recall exist, calculate
+    # their harmonic mean. Otherwise the app will rank by accuracy if available.
+    if "macro_f1" not in frame.columns and {"macro_precision", "macro_recall"}.issubset(frame.columns):
+        denominator = frame["macro_precision"] + frame["macro_recall"]
+        frame["macro_f1"] = (2 * frame["macro_precision"] * frame["macro_recall"] / denominator).where(denominator != 0)
+
+    return frame
+
+
+def get_best_model_row(metrics):
+    """Return (best row, ranking metric); safely handles missing score columns."""
+    if metrics is None or metrics.empty:
+        return None, None
+    for column in ["macro_f1", "accuracy", "macro_precision", "macro_recall"]:
+        if column in metrics.columns and metrics[column].notna().any():
+            return metrics.loc[metrics[column].idxmax()], column
+    return metrics.iloc[0], None
 
 def categories():
     if CATEGORIES_PATH.exists():
@@ -141,9 +240,20 @@ def gmail_service():
         raise FileNotFoundError("credentials.json is missing. Put the downloaded Google OAuth client JSON beside this app.")
     creds = None
     if TOKEN_PATH.exists():
-        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
+        try:
+            creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
+        except Exception:
+            creds = None
+            if TOKEN_PATH.exists():
+                TOKEN_PATH.unlink()
     if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
+        try:
+            creds.refresh(Request())
+        except Exception:
+            # Token was revoked (e.g. after a Google account password change)
+            creds = None
+            if TOKEN_PATH.exists():
+                TOKEN_PATH.unlink()
     if not creds or not creds.valid:
         flow = InstalledAppFlow.from_client_secrets_file(str(CLIENT_PATH), SCOPES)
         creds = flow.run_local_server(port=0)
@@ -151,24 +261,67 @@ def gmail_service():
     return build("gmail", "v1", credentials=creds)
 
 
-def fetch_emails(service, limit):
+def fetch_emails(service, limit, gmail_query=None):
     result_rows, token = [], None
-    while len(result_rows) < limit:
-        response = service.users().messages().list(
-            userId="me", maxResults=min(100, limit - len(result_rows)), pageToken=token, includeSpamTrash=False).execute()
+
+    while limit is None or len(result_rows) < limit:
+        request_args = {
+            "userId": "me",
+            "maxResults": 100 if limit is None else min(100, limit - len(result_rows)),
+            "pageToken": token,
+            "includeSpamTrash": False,
+        }
+        if gmail_query:
+            request_args["q"] = gmail_query
+
+        response = service.users().messages().list(**request_args).execute()
+
         for item in response.get("messages", []):
-            msg = service.users().messages().get(userId="me", id=item["id"], format="full").execute()
-            payload, headers = msg.get("payload", {}), msg.get("payload", {}).get("headers", [])
-            date = get_header(headers, "Date")
+            msg = service.users().messages().get(
+                userId="me", id=item["id"], format="full"
+            ).execute()
+
+            payload = msg.get("payload", {})
+            headers = payload.get("headers", [])
+            raw_date = get_header(headers, "Date")
+
+            # Gmail internalDate is more reliable than the sender's Date header.
+            received_dt = None
             try:
-                date = parsedate_to_datetime(date).strftime("%Y-%m-%d %H:%M")
+                internal_ms = msg.get("internalDate")
+                if internal_ms:
+                    received_dt = datetime.fromtimestamp(
+                        int(internal_ms) / 1000
+                    ).astimezone()
+                elif raw_date:
+                    received_dt = parsedate_to_datetime(raw_date)
+                    if received_dt.tzinfo is None:
+                        received_dt = received_dt.astimezone()
+                    else:
+                        received_dt = received_dt.astimezone()
             except (ValueError, TypeError, OverflowError):
-                pass
-            result_rows.append({"email_id": msg.get("id", ""), "date": date, "sender": get_header(headers, "From"),
-                                "subject": get_header(headers, "Subject"), "body": extract_body(payload)})
+                received_dt = None
+
+            if received_dt:
+                display_date = received_dt.strftime("%Y-%m-%d %H:%M")
+                received_at = received_dt.isoformat()
+            else:
+                display_date = raw_date
+                received_at = None
+
+            result_rows.append({
+                "email_id": msg.get("id", ""),
+                "date": display_date,
+                "received_at": received_at,
+                "sender": get_header(headers, "From"),
+                "subject": get_header(headers, "Subject"),
+                "body": extract_body(payload),
+            })
+
         token = response.get("nextPageToken")
         if not token:
             break
+
     return result_rows
 
 
@@ -271,7 +424,9 @@ input, textarea {color:var(--ink) !important;}
 
 /* mail list: each st.button becomes a card */
 [class*="st-key-mail"] button {width:100%; text-align:left; justify-content:flex-start; background:var(--panel2); border:1px solid var(--line); border-radius:16px; padding:12px 14px; min-height:0; box-shadow:none; height:auto;}
-[class*="st-key-mail"] button p {text-align:left; font-size:.84rem; color:var(--muted); line-height:1.45; margin:0;}
+[class*="st-key-mail"] button > div {width:100%; display:block; text-align:left;}
+[class*="st-key-mail"] button [data-testid="stMarkdownContainer"] {width:100%; text-align:left;}
+[class*="st-key-mail"] button p {text-align:left !important; width:100%; font-size:.84rem; color:var(--muted); line-height:1.45; margin:0;}
 [class*="st-key-mail"] button p strong {color:var(--ink); font-size:.95rem;}
 [class*="st-key-mail"] button:hover {border-color:var(--accent); color:inherit;}
 [class*="st-key-mailsel"] button {background:var(--sel); border-color:var(--accent);}
@@ -344,7 +499,7 @@ with st.sidebar:
         st.markdown(rows_html, unsafe_allow_html=True)
     st.divider()
     light = st.toggle("Light theme", key="light")
-    st.caption("TF-IDF · Linear SVM · 10 classes\n\nLocal academic prototype — predictions may be imperfect.")
+    st.caption("TF-IDF · Saved best classifier · 10 classes\n\nLocal academic prototype — predictions may be imperfect.")
 
 T = THEMES["light" if st.session_state.get("light") else "dark"]
 inject_css(T)
@@ -355,14 +510,13 @@ if page == "Dashboard":
     page_header("✉️", "Dashboard", "email classification dashboard", live=True)
     df = st.session_state.gmail_df
 
-    best_name, best_acc = "Linear SVM", "—"
-    if METRICS_PATH.exists():
-        try:
-            _m = pd.read_csv(METRICS_PATH)
-            _b = _m.sort_values("macro_f1", ascending=False).iloc[0]
-            best_name, best_acc = str(_b["model"]), f"{_b['accuracy']:.1%}"
-        except Exception:
-            pass
+    best_name, best_acc = "Not available", "—"
+    _m = load_model_metrics()
+    _b, _rank_col = get_best_model_row(_m)
+    if _b is not None:
+        best_name = str(_b.get("model", "Unknown model"))
+        if pd.notna(_b.get("accuracy", float("nan"))):
+            best_acc = f"{float(_b['accuracy']):.1%}"
 
     k = st.columns(4)
     with k[0]:
@@ -373,7 +527,7 @@ if page == "Dashboard":
     with k[2]:
         kpi("Best model", best_name, "Selected by macro F1")
     with k[3]:
-        kpi("CV accuracy", best_acc, "Small labeled sample")
+        kpi("CV accuracy", best_acc, "Latest model comparison results")
     st.write("")
 
     if df.empty:
@@ -390,52 +544,90 @@ if page == "Dashboard":
                                 f"<div class='muted' style='margin-top:8px'>{esc(DESCRIPTIONS.get(c, 'College email category'))}</div></div></div>",
                                 unsafe_allow_html=True)
     else:
-        counts = df.predicted_category.value_counts().reindex(CATS, fill_value=0)
-        cdf = pd.DataFrame({"Category": [nice(c) for c in counts.index], "Emails": counts.values})
-        urgent_n = int(df.predicted_category.isin(URGENT).sum())
-        normal_n = len(df) - urgent_n
-
-        c1, c2 = st.columns(2)
-        with c1:
-            with st.container(key="card_bar"):
-                card_head("📄", "Emails by Category", "h1")
-                bar = alt.Chart(cdf).mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6).encode(
-                    x=alt.X("Category:N", sort=None, axis=alt.Axis(labelAngle=-40, title=None)),
-                    y=alt.Y("Emails:Q", title=None),
-                    color=alt.Color("Category:N", scale=cat_scale(), legend=None),
-                    tooltip=["Category", "Emails"]).properties(height=330)
-                st.altair_chart(style_chart(bar, T), use_container_width=True, theme=None)
-        with c2:
-            with st.container(key="card_donut"):
-                card_head("⚠️", "Emails by Priority", "h2")
-                pdf = pd.DataFrame({"Priority": ["High", "Normal"], "Emails": [urgent_n, normal_n]})
-                donut = alt.Chart(pdf).mark_arc(innerRadius=70, outerRadius=115, stroke="#fff", strokeWidth=1.5).encode(
-                    theta="Emails:Q",
-                    color=alt.Color("Priority:N", scale=alt.Scale(domain=["High", "Normal"], range=["#ef4444", "#10b981"]), legend=None),
-                    tooltip=["Priority", "Emails"]).properties(height=330)
-                st.altair_chart(style_chart(donut, T), use_container_width=True, theme=None)
-                st.markdown(f"<div style='text-align:center;padding-bottom:14px;font-weight:600;font-size:.9rem'>"
-                            f"<span style='color:#ef4444'>●</span> High ({urgent_n}) &nbsp;&nbsp; "
-                            f"<span style='color:#10b981'>●</span> Normal ({normal_n})</div>", unsafe_allow_html=True)
-                st.caption("High = exams, assignments, scholarships and placements (deadline-sensitive).")
-
-        with st.container(key="card_timeline"):
-            card_head("📈", "Classification Timeline", "h3")
-            tl = df.copy()
-            tl["when"] = pd.to_datetime(tl["date"], errors="coerce")
-            tl = tl.dropna(subset=["when"])
-            if tl.empty:
-                st.caption("No parsable dates to draw a timeline.")
+        st.markdown("### 📅 Dashboard date filter")
+        valid_days = email_local_dates(df)
+        valid_days = [d for d in valid_days if pd.notna(d)]
+        if valid_days:
+            min_day, max_day = min(valid_days), max(valid_days)
+            date_cols = st.columns([1, 1, 2])
+            with date_cols[0]:
+                dash_start = st.date_input(
+                    "From",
+                    value=min_day,
+                    key="dashboard_start_date",
+                    format="DD/MM/YYYY",
+                )
+            with date_cols[1]:
+                dash_end = st.date_input(
+                    "To",
+                    value=max_day,
+                    key="dashboard_end_date",
+                    format="DD/MM/YYYY",
+                )
+            with date_cols[2]:
+                st.caption("Choose a date range to update the dashboard charts and priority totals.")
+            if dash_start > dash_end:
+                st.warning("Start date cannot be after end date.")
+                dashboard_df = df.iloc[0:0].copy()
             else:
-                tl["day"] = tl["when"].dt.normalize()
-                tl["Category"] = tl["predicted_category"].map(nice)
-                tdf = tl.groupby(["day", "Category"]).size().reset_index(name="Emails")
-                area = alt.Chart(tdf).mark_area(opacity=.75, line=True, interpolate="monotone").encode(
-                    x=alt.X("day:T", title=None), y=alt.Y("Emails:Q", stack=True, title=None),
-                    color=alt.Color("Category:N", scale=cat_scale(), legend=alt.Legend(orient="bottom", columns=5)),
-                    tooltip=["day:T", "Category", "Emails"]).properties(height=260)
-                st.altair_chart(style_chart(area, T), use_container_width=True, theme=None)
+                dashboard_df = filter_by_dates(df, dash_start, dash_end)
+            st.caption(f"{len(dashboard_df):,} emails in the selected date range.")
+        else:
+            dashboard_df = df.copy()
+            st.info("Email dates are unavailable, so the dashboard is showing all classified emails.")
 
+        if dashboard_df.empty:
+            st.info("No classified emails fall within this date range.")
+        else:
+            counts = dashboard_df.predicted_category.value_counts().reindex(CATS, fill_value=0)
+            cdf = pd.DataFrame({"Category": [nice(c) for c in counts.index], "Emails": counts.values})
+            urgent_n = int(dashboard_df.predicted_category.isin(URGENT).sum())
+            normal_n = len(dashboard_df) - urgent_n
+
+            c1, c2 = st.columns(2)
+            with c1:
+                with st.container(key="card_bar"):
+                    card_head("📄", "Emails by Category", "h1")
+                    bar = alt.Chart(cdf).mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6).encode(
+                        x=alt.X("Category:N", sort=None, axis=alt.Axis(labelAngle=-40, title=None)),
+                        y=alt.Y("Emails:Q", title=None),
+                        color=alt.Color("Category:N", scale=cat_scale(), legend=None),
+                        tooltip=["Category", "Emails"]).properties(height=330)
+                    st.altair_chart(style_chart(bar, T), use_container_width=True, theme=None)
+            with c2:
+                with st.container(key="card_donut"):
+                    card_head("⚠️", "Emails by Priority", "h2")
+                    pdf = pd.DataFrame({"Priority": ["High", "Normal"], "Emails": [urgent_n, normal_n]})
+                    donut = alt.Chart(pdf).mark_arc(innerRadius=70, outerRadius=115, stroke="#fff", strokeWidth=1.5).encode(
+                        theta="Emails:Q",
+                        color=alt.Color("Priority:N", scale=alt.Scale(domain=["High", "Normal"], range=["#ef4444", "#10b981"]), legend=None),
+                        tooltip=["Priority", "Emails"]).properties(height=330)
+                    st.altair_chart(style_chart(donut, T), use_container_width=True, theme=None)
+                    st.markdown(f"<div style='text-align:center;padding-bottom:14px;font-weight:600;font-size:.9rem'>"
+                                f"<span style='color:#ef4444'>●</span> High ({urgent_n}) &nbsp;&nbsp; "
+                                f"<span style='color:#10b981'>●</span> Normal ({normal_n})</div>", unsafe_allow_html=True)
+                    st.caption("High = exams, assignments, scholarships and placements (deadline-sensitive).")
+    
+            with st.container(key="card_timeline"):
+                card_head("📈", "Classification Timeline", "h3")
+                tl = dashboard_df.copy()
+                if "received_at" in tl.columns:
+                    tl["when"] = pd.to_datetime(tl["received_at"], errors="coerce", utc=True).dt.tz_convert("Asia/Kolkata")
+                else:
+                    tl["when"] = pd.to_datetime(tl["date"], errors="coerce")
+                tl = tl.dropna(subset=["when"])
+                if tl.empty:
+                    st.caption("No parsable dates to draw a timeline.")
+                else:
+                    tl["day"] = tl["when"].dt.normalize()
+                    tl["Category"] = tl["predicted_category"].map(nice)
+                    tdf = tl.groupby(["day", "Category"]).size().reset_index(name="Emails")
+                    area = alt.Chart(tdf).mark_area(opacity=.75, line=True, interpolate="monotone").encode(
+                        x=alt.X("day:T", title=None), y=alt.Y("Emails:Q", stack=True, title=None),
+                        color=alt.Color("Category:N", scale=cat_scale(), legend=alt.Legend(orient="bottom", columns=5)),
+                        tooltip=["day:T", "Category", "Emails"]).properties(height=260)
+                    st.altair_chart(style_chart(area, T), use_container_width=True, theme=None)
+    
 # ═════════════════════════════ INBOX ═════════════════════════════
 elif page == "Inbox":
     df = st.session_state.gmail_df
@@ -444,30 +636,105 @@ elif page == "Inbox":
     with st.expander("Connect Gmail (read-only)", expanded=df.empty):
         st.caption("Google sign-in is required — entering an address alone grants no access. This OAuth flow is for local "
                    "single-user testing; do not deploy it as a multi-user service as-is.")
-        a, b, c = st.columns([2, 2, 1.2])
-        entered_email = a.text_input("Gmail address (optional reference)", placeholder="student@gmail.com")
-        limit = b.select_slider("Messages to process", options=[25, 50, 100, 250, 500, 1000], value=100)
-        c.write("")
-        c.write("")
-        run = c.button("🔐 Sign in & classify", type="primary", use_container_width=True)
-        st.caption("Start with 25–100 messages to validate the model. Each message is fetched individually from Gmail.")
+        entered_email = st.text_input(
+            "Gmail address (optional reference)",
+            placeholder="student@gmail.com",
+            key="gmail_reference_email",
+        )
+        fetch_mode = st.radio(
+            "Fetch emails by",
+            ["Recent emails", "Custom date range"],
+            horizontal=True,
+            key="gmail_fetch_mode",
+        )
+
+        date_range = None
+        if fetch_mode == "Custom date range":
+            date_range = st.date_input(
+                "Select start date and end date",
+                value=(date.today() - timedelta(days=7), date.today()),
+                max_value=date.today(),
+                format="DD/MM/YYYY",
+                key="gmail_custom_date_range",
+            )
+            st.caption("The selected start and end dates are both included.")
+
+        if fetch_mode == "Recent emails":
+            limit = st.select_slider(
+                "Maximum messages to process",
+                options=[25, 50, 100, 250, 500, 1000],
+                value=100,
+                key="gmail_fetch_limit",
+            )
+        else:
+            # Custom date range: fetch every message matching the Gmail date query.
+            limit = None
+        btn_col1, btn_col2 = st.columns([3, 1])
+        with btn_col1:
+            run = st.button(
+                "🔐 Sign in & classify",
+                type="primary",
+                use_container_width=True,
+                key="gmail_sync_button",
+            )
+        with btn_col2:
+            if st.button("🔄 Reset Login", use_container_width=True, help="Clear saved token to re-authenticate (useful if you changed your password)"):
+                if TOKEN_PATH.exists():
+                    TOKEN_PATH.unlink()
+                st.session_state.pop("gmail_df", None)
+                st.session_state.pop("gmail_account", None)
+                st.info("Saved login cleared. Click 'Sign in & classify' to authenticate with your Google account.")
+                st.rerun()
+        st.caption(
+            "Recent mode fetches the newest messages up to the selected limit. "
+            "Custom date range mode fetches all messages within the selected dates (no message cap)."
+        )
 
     if run:
         try:
+            selected_start = selected_end = None
+            gmail_query = None
+
+            if fetch_mode == "Custom date range":
+                if not isinstance(date_range, (tuple, list)) or len(date_range) != 2:
+                    st.error("Please select both a start date and an end date.")
+                    st.stop()
+                selected_start, selected_end = date_range
+                if selected_start > selected_end:
+                    st.error("Start date cannot be after end date.")
+                    st.stop()
+                gmail_query = gmail_date_query(selected_start, selected_end)
+
             with st.spinner("Opening Google authorization..."):
                 service = gmail_service()
             profile = service.users().getProfile(userId="me").execute()
             account = profile.get("emailAddress", "")
             if entered_email.strip() and entered_email.strip().lower() != account.lower():
                 st.warning(f"The authorized account is {account}; that account will be used.")
-            with st.spinner(f"Fetching up to {limit} recent messages..."):
-                rows = fetch_emails(service, int(limit))
-            with st.spinner("Loading model and predicting categories..."):
+
+            if gmail_query:
+                fetch_description = (
+                    f"emails from {selected_start:%d %b %Y} "
+                    f"to {selected_end:%d %b %Y}"
+                )
+            else:
+                fetch_description = f"up to {limit} recent messages"
+
+            with st.spinner(f"Fetching {fetch_description}..."):
+                rows = fetch_emails(
+                    service,
+                    None if gmail_query else int(limit),
+                    gmail_query=gmail_query,
+                )
+
+            with st.spinner("Loading the latest saved model and predicting categories..."):
                 model = load_model()
                 df = predict_emails(rows, model)
+
             st.session_state.gmail_df = df
             st.session_state.gmail_account = account
             st.session_state.sel_id = None
+            st.session_state.gmail_fetch_description = fetch_description
             st.success(f"Classified {len(df)} messages from {account}.")
             st.rerun()
         except Exception as e:
@@ -480,15 +747,63 @@ elif page == "Inbox":
                     "<p class='muted'>Open <b>Connect Gmail</b> above and sign in to classify your recent messages.</p></div></div>",
                     unsafe_allow_html=True)
     else:
-        # top bar: search + category filter + export (like the search bar in the references)
-        s1, s2, s3 = st.columns([3, 1.4, 1.2])
-        search_text = s1.text_input("Search", placeholder="🔍  Search sender or subject…", label_visibility="collapsed", key="inbox_search")
-        selected = s2.selectbox("Category", ["All categories"] + [c for c in CATS if c in set(df.predicted_category)],
-                                format_func=lambda c: c if c == "All categories" else nice(c), label_visibility="collapsed")
-        s3.download_button("⬇ Export CSV", df.to_csv(index=False).encode("utf-8-sig"), "campusmail_categorized_emails.csv",
-                           "text/csv", use_container_width=True)
+        # Calendar filter applies to already-fetched messages as well.
+        st.markdown("### 📅 Filter your classified inbox")
+        available_days = email_local_dates(df)
+        available_days = [d for d in available_days if pd.notna(d)]
 
-        view = df if selected == "All categories" else df[df.predicted_category == selected]
+        if available_days:
+            min_day, max_day = min(available_days), max(available_days)
+            date_cols = st.columns([1, 1, 1.5])
+            with date_cols[0]:
+                inbox_start = st.date_input(
+                    "From",
+                    value=min_day,
+                    key="inbox_filter_start",
+                    format="DD/MM/YYYY",
+                )
+            with date_cols[1]:
+                inbox_end = st.date_input(
+                    "To",
+                    value=max_day,
+                    key="inbox_filter_end",
+                    format="DD/MM/YYYY",
+                )
+            with date_cols[2]:
+                st.caption("This calendar filters the emails currently loaded in the inbox.")
+            if inbox_start > inbox_end:
+                st.warning("Start date cannot be after end date.")
+                date_filtered_df = df.iloc[0:0].copy()
+            else:
+                date_filtered_df = filter_by_dates(df, inbox_start, inbox_end)
+        else:
+            date_filtered_df = df.copy()
+            st.caption("Email dates could not be parsed; showing all loaded emails.")
+
+        # Search + category filter + export
+        s1, s2, s3 = st.columns([3, 1.4, 1.2])
+        search_text = s1.text_input(
+            "Search",
+            placeholder="🔍  Search sender or subject…",
+            label_visibility="collapsed",
+            key="inbox_search",
+        )
+        selected = s2.selectbox(
+            "Category",
+            ["All categories"] + [c for c in CATS if c in set(date_filtered_df.predicted_category)],
+            format_func=lambda c: c if c == "All categories" else nice(c),
+            label_visibility="collapsed",
+            key="inbox_category_filter",
+        )
+        s3.download_button(
+            "⬇ Export CSV",
+            date_filtered_df.to_csv(index=False).encode("utf-8-sig"),
+            "campusmail_categorized_emails.csv",
+            "text/csv",
+            use_container_width=True,
+        )
+
+        view = date_filtered_df if selected == "All categories" else date_filtered_df[date_filtered_df.predicted_category == selected]
         if search_text.strip():
             needle = search_text.strip().lower()
             view = view[view.apply(lambda r: needle in str(r.get("sender", "")).lower() or needle in str(r.get("subject", "")).lower(), axis=1)]
@@ -560,49 +875,71 @@ elif page == "Try a Prediction":
 # ═════════════════════════════ MODEL LAB ═════════════════════════════
 elif page == "Model Lab":
     page_header("🧪", "Model Lab", "compare the tested algorithms and inspect saved evaluation outputs")
+    if MODEL_PATH.exists():
+        model_updated = datetime.fromtimestamp(MODEL_PATH.stat().st_mtime).strftime("%d %b %Y, %I:%M %p")
+        st.caption(f"Active prediction artifact: {MODEL_PATH.name} · Last modified: {model_updated}")
+    else:
+        st.warning(f"Saved prediction model not found: {MODEL_PATH}")
     if METRICS_PATH.exists():
-        metrics = pd.read_csv(METRICS_PATH)
-        st.caption("Cross-validation results from the project outputs. The labeled dataset is small (100 examples), "
-                   "so treat these numbers as indicative, not production-grade.")
-        if not metrics.empty:
-            best = metrics.sort_values("macro_f1", ascending=False).iloc[0]
-            k = st.columns(4)
-            with k[0]:
-                kpi("Top model", str(best["model"]), "Highest macro F1")
-            with k[1]:
-                kpi("Accuracy", f"{best['accuracy']:.1%}", "CV score")
-            with k[2]:
-                kpi("Macro F1", f"{best['macro_f1']:.3f}", "Equal weight per class")
-            with k[3]:
-                kpi("Models tested", str(len(metrics)), "Same experiment output")
-            st.write("")
-        m1, m2 = st.columns([1, 1])
-        with m1:
-            with st.container(key="card_cmp_table"):
-                card_head("📋", "Model comparison", "h1")
-                display = metrics.copy()
-                for col in ["accuracy", "macro_precision", "macro_recall", "macro_f1"]:
-                    if col in display:
-                        display[col] = display[col].map(lambda x: f"{x:.3f} ({x:.1%})")
-                st.dataframe(display, use_container_width=True, hide_index=True)
-        with m2:
-            with st.container(key="card_cmp_chart"):
-                card_head("📊", "Score comparison", "h4")
-                long = metrics.melt(id_vars="model", value_vars=[c for c in ["accuracy", "macro_precision", "macro_recall", "macro_f1"] if c in metrics],
-                                    var_name="Metric", value_name="Score")
-                ch = alt.Chart(long).mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4).encode(
-                    x=alt.X("model:N", title=None, axis=alt.Axis(labelAngle=0)), y=alt.Y("Score:Q", title=None),
-                    xOffset="Metric:N", color=alt.Color("Metric:N", legend=alt.Legend(orient="bottom")),
-                    tooltip=["model", "Metric", alt.Tooltip("Score:Q", format=".3f")]).properties(height=280)
-                st.altair_chart(style_chart(ch, T), use_container_width=True, theme=None)
+        metrics = load_model_metrics()
+        st.caption("Evaluation results are read from outputs/model_comparison.csv on each app run. "
+                   "The table and chart reflect the latest saved comparison file.")
+        if metrics.empty:
+            st.info("The model comparison file exists but contains no evaluation rows.")
+        else:
+            best, ranking_metric = get_best_model_row(metrics)
+            if best is not None:
+                k = st.columns(4)
+                with k[0]:
+                    st.metric("Top model", str(best.get("model", "Unknown")))
+                with k[1]:
+                    acc = best.get("accuracy", float("nan"))
+                    st.metric("Accuracy", f"{float(acc):.1%}" if pd.notna(acc) else "N/A", "Saved evaluation score")
+                with k[2]:
+                    f1 = best.get("macro_f1", float("nan"))
+                    st.metric("Macro F1", f"{float(f1):.3f}" if pd.notna(f1) else "N/A", "Equal weight per class")
+                with k[3]:
+                    st.metric("Models tested", str(len(metrics)))
+                if ranking_metric is None:
+                    st.warning("No recognized evaluation score column was found. Showing the first model row.")
+                elif ranking_metric != "macro_f1":
+                    st.info(f"Macro F1 was unavailable, so the best model is ranked by {ranking_metric.replace('_', ' ')}.")
+            m1, m2 = st.columns([1, 1])
+            with m1:
+                with st.container(key="card_cmp_table"):
+                    card_head("📋", "Model comparison", "h1")
+                    display = metrics.copy()
+                    for col in ["accuracy", "macro_precision", "macro_recall", "macro_f1"]:
+                        if col in display:
+                            display[col] = display[col].map(lambda x: f"{x:.3f} ({x:.1%})" if pd.notna(x) else "N/A")
+                    st.dataframe(display, use_container_width=True, hide_index=True)
+            with m2:
+                with st.container(key="card_cmp_chart"):
+                    card_head("📊", "Score comparison", "h4")
+                    score_columns = [c for c in ["accuracy", "macro_precision", "macro_recall", "macro_f1"] if c in metrics.columns]
+                    if score_columns:
+                        long = metrics.melt(id_vars="model", value_vars=score_columns,
+                                            var_name="Metric", value_name="Score").dropna(subset=["Score"])
+                        if not long.empty:
+                            ch = alt.Chart(long).mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4).encode(
+                                x=alt.X("model:N", title=None, axis=alt.Axis(labelAngle=0)),
+                                y=alt.Y("Score:Q", title=None), xOffset="Metric:N",
+                                color=alt.Color("Metric:N", legend=alt.Legend(orient="bottom")),
+                                tooltip=["model", "Metric", alt.Tooltip("Score:Q", format=".3f")]
+                            ).properties(height=280)
+                            st.altair_chart(style_chart(ch, T), use_container_width=True, theme=None)
+                        else:
+                            st.info("No numeric score values are available to chart.")
+                    else:
+                        st.info("No recognized score columns were found. Available columns: " + ", ".join(metrics.columns))
 
-        e1, e2 = st.columns(2)
-        with e1:
-            st.markdown("<div class='card'><div class='card-body'><b>Accuracy</b><p class='muted'>Share of all evaluated messages given the correct category. Can hide poor performance on rarer classes.</p>"
-                        "<b>Precision</b><p class='muted'>Of messages predicted as a category, how many were correct.</p></div></div>", unsafe_allow_html=True)
-        with e2:
-            st.markdown("<div class='card'><div class='card-body'><b>Recall</b><p class='muted'>Of the messages truly in a category, how many the model found.</p>"
-                        "<b>Macro F1</b><p class='muted'>Balance of precision and recall, averaged equally across categories.</p></div></div>", unsafe_allow_html=True)
+            e1, e2 = st.columns(2)
+            with e1:
+                st.markdown("<div class='card'><div class='card-body'><b>Accuracy</b><p class='muted'>Share of all evaluated messages given the correct category. Can hide poor performance on rarer classes.</p>"
+                            "<b>Precision</b><p class='muted'>Of messages predicted as a category, how many were correct.</p></div></div>", unsafe_allow_html=True)
+            with e2:
+                st.markdown("<div class='card'><div class='card-body'><b>Recall</b><p class='muted'>Of the messages truly in a category, how many the model found.</p>"
+                            "<b>Macro F1</b><p class='muted'>Balance of precision and recall, averaged equally across categories.</p></div></div>", unsafe_allow_html=True)
     else:
         st.info("Model comparison file not found: outputs/model_comparison.csv")
 
@@ -610,7 +947,16 @@ elif page == "Model Lab":
         report = pd.read_csv(REPORT_PATH)
         report = report[~report.category.isin(["accuracy", "macro avg", "weighted avg"])]
         with st.container(key="card_report"):
-            card_head("🏷️", "Per-category performance — Linear SVM", "h3")
+            report_model_name = "Best saved model"
+            if METRICS_PATH.exists():
+                try:
+                    metric_rows = load_model_metrics()
+                    metric_best, _metric_used = get_best_model_row(metric_rows)
+                    if metric_best is not None:
+                        report_model_name = str(metric_best.get("model", "Best saved model"))
+                except Exception:
+                    pass
+            card_head("🏷️", f"Per-category performance — {report_model_name}", "h3")
             st.caption("F1 helps spot categories that need more verified training examples.")
             r1, r2 = st.columns([1, 1.2])
             r1.dataframe(report, use_container_width=True, hide_index=True)

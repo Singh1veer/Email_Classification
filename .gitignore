@@ -1,4 +1,42 @@
+
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Credentials and secrets
 credentials.json
 token.json
 client_secret*.json
 .env
+.env.*
+
+# IDE and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temporary and backup files
+*.log
+*.tmp
+backups/
+
+# Private datasets
+data/*
+!data/.gitkeep
+
+# Generated outputs
+outputs/*
+!outputs/model_comparison.csv
+!outputs/best_model_classification_report.csv
+!outputs/best_model_confusion_matrix.csv
+
+# Model files: retain only the application model
+models/*.joblib
+!models/best_email_classifier.joblib

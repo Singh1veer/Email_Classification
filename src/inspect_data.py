@@ -14,7 +14,6 @@ if not DATA_PATH.exists():
         "Place college_emails.csv inside the data folder."
     )
 
-# Read the dataset
 df = pd.read_csv(DATA_PATH, low_memory=False)
 
 print("\n--- DATASET OVERVIEW ---")

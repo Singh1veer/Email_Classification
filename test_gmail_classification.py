@@ -21,12 +21,23 @@ def connect_gmail():
     creds = None
 
     if TOKEN_PATH.exists():
-        creds = Credentials.from_authorized_user_file(
-            str(TOKEN_PATH), SCOPES
-        )
+        try:
+            creds = Credentials.from_authorized_user_file(
+                str(TOKEN_PATH), SCOPES
+            )
+        except Exception:
+            creds = None
+            if TOKEN_PATH.exists():
+                TOKEN_PATH.unlink()
 
     if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
+        try:
+            creds.refresh(Request())
+        except Exception:
+            # Token revoked, e.g. after Google account password change
+            creds = None
+            if TOKEN_PATH.exists():
+                TOKEN_PATH.unlink()
 
     if not creds or not creds.valid:
         flow = InstalledAppFlow.from_client_secrets_file(
